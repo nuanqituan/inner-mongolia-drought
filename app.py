@@ -124,6 +124,15 @@ else:
         original_bounds = xds.rio.bounds()
         st.sidebar.info(f"🗺️ 数据边界: 经度 [{original_bounds[0]:.2f}, {original_bounds[2]:.2f}], 纬度 [{original_bounds[1]:.2f}, {original_bounds[3]:.2f}]")
         
+        # 验证边界合理性
+        expected_bounds = (97, 37, 126, 53)  # 内蒙古大致范围
+        if (abs(original_bounds[0] - expected_bounds[0]) > 10 or 
+            abs(original_bounds[2] - expected_bounds[2]) > 10):
+            st.warning(f"⚠️ 数据边界异常! 预期经度 [{expected_bounds[0]}, {expected_bounds[2]}]")
+        if (abs(original_bounds[1] - expected_bounds[1]) > 10 or 
+            abs(original_bounds[3] - expected_bounds[3]) > 10):
+            st.warning(f"⚠️ 数据边界异常! 预期纬度 [{expected_bounds[1]}, {expected_bounds[3]}]")
+        
         # 裁剪 (如果选了区域)
         if selected_geom is not None:
             xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
@@ -157,17 +166,14 @@ else:
             # 2. 将数据映射到颜色 (RGBA格式)
             rgba_array = cmap(norm(data_clean))
             
-            # 3. 设置透明度: 有效数据=不透明, 背景=透明
-            alpha_channel = np.where(valid_mask, 0.7, 0.0)  # 70%不透明度
+            # 3. 设置透明度: 有效数据=完全不透明, 背景=透明
+            alpha_channel = np.where(valid_mask, 1.0, 0.0)  # 100%不透明度
             rgba_array[..., 3] = alpha_channel
             
-            # 4. 翻转Y轴 (重要! leaflet坐标系与numpy相反)
-            # 注意: 只有当数据是从北到南排列时才需要翻转
-            # 检查Y坐标是递增还是递减
-            y_coords = xds.y.values
-            if y_coords[0] < y_coords[-1]:  # 如果是从南到北(递增),需要翻转
-                rgba_array = np.flipud(rgba_array)
-                st.sidebar.write("🔄 已翻转Y轴(南→北)")
+            # 4. 不需要翻转! 
+            # rioxarray读取的数据Y轴已经是正确方向(北→南)
+            # folium的ImageOverlay会自动处理
+            # rgba_array = rgba_array (保持原样)
             
             # 5. 转换为图片
             from PIL import Image
@@ -191,12 +197,20 @@ else:
             st.sidebar.write(f"西: {bounds[0]:.2f}, 南: {bounds[1]:.2f}")
             st.sidebar.write(f"东: {bounds[2]:.2f}, 北: {bounds[3]:.2f}")
             
-            # 8. 添加图片到地图
+            # 8. 添加图片到地图 (使用正确的边界顺序)
             import folium
+            
+            # 调试: 显示边界信息
+            st.sidebar.write(f"📍 图层边界: 南{bounds[1]:.2f}° 西{bounds[0]:.2f}°")
+            st.sidebar.write(f"              北{bounds[3]:.2f}° 东{bounds[2]:.2f}°")
+            
             img_overlay = folium.raster_layers.ImageOverlay(
                 image=temp_png,
                 bounds=leaflet_bounds,
-                opacity=0.75,
+                opacity=0.85,  # 提高不透明度
+                interactive=True,
+                cross_origin=False,
+                zindex=1,
                 name='SPEI干旱指数'
             )
             img_overlay.add_to(m)
