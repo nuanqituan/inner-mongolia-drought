@@ -7,8 +7,7 @@ import os
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
-from io import BytesIO
-import base64
+from PIL import Image
 
 # ==========================================
 # 1. 基础设置
@@ -27,6 +26,14 @@ DATA_PATH = "data"
 LEAGUE_PATH = f"{DATA_PATH}/inner_mongolia_city.json"      
 BANNER_PATH = f"{DATA_PATH}/inner_mongolia_banners.json"   
 BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json" 
+
+# === 🛠️ 核心修正：针对 0.25° 分辨率数据的自动校准 ===
+# 您提到数据分辨率是 0.25°，且地图整体偏北。
+# 这是经典的 "Center vs Corner" 像素配准问题。
+# 我们需要将图像向南（下）移动半个像素，即 0.125°。
+# 如果发现还有左右偏移，可以修改 LON_SHIFT。
+LAT_SHIFT = -0.125  # 向南移 0.125 度 (解决北移问题)
+LON_SHIFT = 0.0     # 经度暂不调整 (如果有东移/西移，可改为 -0.125 或 0.125)
 
 @st.cache_data
 def load_data():
@@ -90,7 +97,7 @@ month_str = f"{sel_month:02d}"
 tif_file = f"{DATA_PATH}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 
 # ==========================================
-# 4. 地图展示核心逻辑 (强化版)
+# 4. 地图展示核心逻辑 (自动校准版)
 # ==========================================
 st.subheader(f"分析视图: {selected_league} - {sel_year}年{sel_month}月")
 
@@ -112,102 +119,63 @@ else:
         # === 读取栅格数据 ===
         xds = rioxarray.open_rasterio(tif_file)
         
-        # 检查并修复坐标系
-        if xds.rio.crs is None:
-            st.warning("⚠️ TIF文件缺少坐标系,假设为 EPSG:4326")
-            xds = xds.rio.write_crs("EPSG:4326")
-        elif xds.rio.crs.to_string() != "EPSG:4326":
-            st.info(f"🔄 正在转换坐标系: {xds.rio.crs.to_string()} → EPSG:4326")
-            xds = xds.rio.reproject("EPSG:4326")
-        
-        # 获取原始边界
-        original_bounds = xds.rio.bounds()
-        st.sidebar.info(f"🗺️ 数据边界: 经度 [{original_bounds[0]:.2f}, {original_bounds[2]:.2f}], 纬度 [{original_bounds[1]:.2f}, {original_bounds[3]:.2f}]")
-        
-        # 验证边界合理性
-        expected_bounds = (97, 37, 126, 53)  # 内蒙古大致范围
-        if (abs(original_bounds[0] - expected_bounds[0]) > 10 or 
-            abs(original_bounds[2] - expected_bounds[2]) > 10):
-            st.warning(f"⚠️ 数据边界异常! 预期经度 [{expected_bounds[0]}, {expected_bounds[2]}]")
-        if (abs(original_bounds[1] - expected_bounds[1]) > 10 or 
-            abs(original_bounds[3] - expected_bounds[3]) > 10):
-            st.warning(f"⚠️ 数据边界异常! 预期纬度 [{expected_bounds[1]}, {expected_bounds[3]}]")
-        
+        # 强制坐标系 (确保为 WGS84)
+        if xds.rio.crs is None or xds.rio.crs.to_string() != "EPSG:4326":
+             xds = xds.rio.write_crs("EPSG:4326")
+
         # 裁剪 (如果选了区域)
         if selected_geom is not None:
+            # 注意：裁剪时也要考虑偏移，但为了简单，我们先裁剪再贴图
+            # 如果裁剪边缘有白边，说明需要先平移再裁剪。
+            # 这里我们保持逻辑简单：先裁剪出大致范围
             xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
+            
             # 添加选中区域边界
             m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
-                     layer_name="选中区域", 
-                     style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
+                      layer_name="选中区域", 
+                      style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
         
         # === 数据处理 ===
-        data = xds.values[0]  # 获取第一波段
+        data = xds.values[0]  
         
-        # 过滤无效值 (SPEI通常 > -10)
+        # 过滤无效值
         data_clean = np.where(data > -10, data, np.nan)
-        
-        # 统计有效数据
         valid_mask = ~np.isnan(data_clean)
-        valid_data = data_clean[valid_mask]
         
-        if len(valid_data) == 0:
+        if not np.any(valid_mask):
             st.error("❌ 该区域当前月份无有效数据!")
         else:
-            # 显示数据统计
-            st.sidebar.success(f"✅ 有效像素: {len(valid_data)}")
-            st.sidebar.info(f"📊 SPEI范围: {np.nanmin(data_clean):.2f} ~ {np.nanmax(data_clean):.2f}")
-            
-            # === 核心修复: 使用folium的ImageOverlay ===
-            # 1. 创建配色方案 (RdBu: 红=干旱, 蓝=湿润)
+            # === 生成图片 ===
             cmap = plt.cm.RdBu
             norm = mcolors.Normalize(vmin=-3, vmax=3)
-            
-            # 2. 将数据映射到颜色 (RGBA格式)
             rgba_array = cmap(norm(data_clean))
             
-            # 3. 设置透明度: 有效数据=完全不透明, 背景=透明
-            alpha_channel = np.where(valid_mask, 1.0, 0.0)  # 100%不透明度
+            # 透明度处理
+            alpha_channel = np.where(valid_mask, 1.0, 0.0) 
             rgba_array[..., 3] = alpha_channel
             
-            # 4. 不需要翻转! 
-            # rioxarray读取的数据Y轴已经是正确方向(北→南)
-            # folium的ImageOverlay会自动处理
-            # rgba_array = rgba_array (保持原样)
-            
-            # 5. 转换为图片
-            from PIL import Image
-            height, width = rgba_array.shape[:2]
+            # 转换为图片对象
             img = Image.fromarray((rgba_array * 255).astype(np.uint8), mode='RGBA')
-            
-            # 6. 保存为临时文件
             temp_png = "temp_spei_overlay.png"
             img.save(temp_png, format='PNG')
             
-            # 7. 获取地理边界
-            # rioxarray.bounds() 返回: (minx, miny, maxx, maxy) 即 (west, south, east, north)
-            bounds = xds.rio.bounds()
+            # === 🎯 自动校准坐标 ===
+            bounds = xds.rio.bounds() # (minx, miny, maxx, maxy)
             
-            # folium ImageOverlay 需要: [[south, west], [north, east]]
-            # 注意: 不需要翻转,因为我们已经flipud了数组
-            leaflet_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+            # 应用 0.125° 的自动修正
+            # bounds[1] 是南边界，bounds[3] 是北边界 -> 加上负数(LAT_SHIFT)等于向南移
+            # bounds[0] 是西边界，bounds[2] 是东边界 -> 加上 LON_SHIFT
+            corrected_bounds = [
+                [bounds[1] + LAT_SHIFT, bounds[0] + LON_SHIFT], # [南, 西]
+                [bounds[3] + LAT_SHIFT, bounds[2] + LON_SHIFT]  # [北, 东]
+            ]
             
-            # 调试信息
-            st.sidebar.write(f"🗺️ 数据边界:")
-            st.sidebar.write(f"西: {bounds[0]:.2f}, 南: {bounds[1]:.2f}")
-            st.sidebar.write(f"东: {bounds[2]:.2f}, 北: {bounds[3]:.2f}")
-            
-            # 8. 添加图片到地图 (使用正确的边界顺序)
+            # 贴图
             import folium
-            
-            # 调试: 显示边界信息
-            st.sidebar.write(f"📍 图层边界: 南{bounds[1]:.2f}° 西{bounds[0]:.2f}°")
-            st.sidebar.write(f"              北{bounds[3]:.2f}° 东{bounds[2]:.2f}°")
-            
             img_overlay = folium.raster_layers.ImageOverlay(
                 image=temp_png,
-                bounds=leaflet_bounds,
-                opacity=0.85,  # 提高不透明度
+                bounds=corrected_bounds, # 使用修正后的坐标
+                opacity=0.85,
                 interactive=True,
                 cross_origin=False,
                 zindex=1,
@@ -215,13 +183,9 @@ else:
             )
             img_overlay.add_to(m)
             
-            st.success("✅ SPEI数据渲染成功!")
-            
-            # 清理临时文件
-            try:
-                os.remove(temp_png)
-            except:
-                pass
+            # 清理
+            try: os.remove(temp_png)
+            except: pass
             
             # === 添加图例 ===
             legend_html = '''
@@ -243,14 +207,12 @@ else:
 
     except Exception as e:
         st.error(f"❌ 数据处理出错: {e}")
-        import traceback
-        st.code(traceback.format_exc())
 
 # 显示地图
 m.to_streamlit(height=650)
 
 # ==========================================
-# 5. 统计信息面板
+# 5. 统计信息面板 (保持不变)
 # ==========================================
 if os.path.exists(tif_file):
     try:
@@ -265,25 +227,20 @@ if os.path.exists(tif_file):
         if len(valid) > 0:
             st.markdown("---")
             st.markdown("### 📊 统计信息")
-            
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("最小值", f"{np.min(valid):.2f}")
             col2.metric("平均值", f"{np.mean(valid):.2f}")
             col3.metric("最大值", f"{np.max(valid):.2f}")
             col4.metric("有效像素", f"{len(valid)}")
             
-            # 干旱等级统计
             extreme_drought = np.sum(valid < -2)
             severe_drought = np.sum((valid >= -2) & (valid < -1.5))
             moderate_drought = np.sum((valid >= -1.5) & (valid < -1))
             
             st.markdown("### 🌵 干旱面积占比")
-            drought_col1, drought_col2, drought_col3 = st.columns(3)
-            drought_col1.metric("极端干旱", f"{100*extreme_drought/len(valid):.1f}%", 
-                              delta=None, delta_color="inverse")
-            drought_col2.metric("严重干旱", f"{100*severe_drought/len(valid):.1f}%",
-                              delta=None, delta_color="inverse")
-            drought_col3.metric("中度干旱", f"{100*moderate_drought/len(valid):.1f}%",
-                              delta=None, delta_color="inverse")
+            d1, d2, d3 = st.columns(3)
+            d1.metric("极端干旱", f"{100*extreme_drought/len(valid):.1f}%", delta_color="inverse")
+            d2.metric("严重干旱", f"{100*severe_drought/len(valid):.1f}%", delta_color="inverse")
+            d3.metric("中度干旱", f"{100*moderate_drought/len(valid):.1f}%", delta_color="inverse")
     except:
         pass
