@@ -29,6 +29,14 @@ LEAGUE_PATH = f"{DATA_PATH}/inner_mongolia_city.json"
 BANNER_PATH = f"{DATA_PATH}/inner_mongolia_banners.json"   
 BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json" 
 
+# === 🎯 坐标硬校准 (根据您的反馈) ===
+# 现象：地图整体偏北 2 个像元
+# 分辨率：0.25度
+# 修正计算：2 * 0.25 = 0.5度
+# 修正方向：向下（向南），即 纬度减去 0.5
+FIX_LAT_OFFSET = -0.5  # 向南平移 0.5 度
+FIX_LON_OFFSET = 0.0   # 经度保持不变
+
 @st.cache_data
 def load_data():
     if not os.path.exists(LEAGUE_PATH): return None, None
@@ -96,7 +104,7 @@ tif_file = f"{DATA_PATH}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 col_map, col_stats = st.columns([3, 1])
 
 # ==========================================
-# 5. 地图展示核心逻辑 (PNG贴图 + 原始坐标)
+# 5. 地图展示核心逻辑 (PNG贴图 + 硬校准)
 # ==========================================
 with col_map:
     st.subheader(f"🗺️ 分析视图: {selected_league}")
@@ -115,19 +123,19 @@ with col_map:
             # === 读取数据 ===
             xds = rioxarray.open_rasterio(tif_file)
             
-            # 【重要调整】: 不再强制重投影，保持原始坐标系，避免变形
-            # 如果原始数据没有坐标系，才赋予 EPSG:4326
+            # 不重投影，只赋予坐标系
             if xds.rio.crs is None:
                 xds = xds.rio.write_crs("EPSG:4326")
 
             # 裁剪
             if selected_geom is not None:
                 try:
+                    # 注意：如果硬偏移量很大，先裁剪可能会导致边缘切掉一点点
+                    # 但0.5度通常还好。为了完美，可以先贴图再加框，但为了速度还是先clip
                     xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
                     m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
                               layer_name="选中区域", style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
-                except:
-                    pass
+                except: pass
 
             # === 数据处理 (生成PNG) ===
             data = xds.values[0]
@@ -145,20 +153,13 @@ with col_map:
                 temp_png = "temp_spei_visual.png"
                 img.save(temp_png, format='PNG')
                 
-                # === 坐标系统 (加回微调功能，以防万一) ===
+                # === 坐标应用 (硬编码修正) ===
                 bounds = xds.rio.bounds() # (minx, miny, maxx, maxy)
                 
-                # 隐藏的微调器：如果位置还不对，点开这个expander手动调
-                with st.expander("🛠️ 地图对齐微调 (如果位置有偏差请点我)", expanded=False):
-                    lat_offset = st.slider("↕️ 南北偏移", -0.5, 0.5, 0.0, 0.05)
-                    lon_offset = st.slider("↔️ 东西偏移", -0.5, 0.5, 0.0, 0.05)
-                
-                # 应用坐标 (原始坐标 + 微调量)
-                # Folium顺序: [[LatMin, LonMin], [LatMax, LonMax]] => [[South, West], [North, East]]
-                # xds.bounds 是 (West, South, East, North)
+                # 直接应用 FIX_LAT_OFFSET (-0.5)
                 leaflet_bounds = [
-                    [bounds[1] + lat_offset, bounds[0] + lon_offset], 
-                    [bounds[3] + lat_offset, bounds[2] + lon_offset]
+                    [bounds[1] + FIX_LAT_OFFSET, bounds[0] + FIX_LON_OFFSET], # South-West
+                    [bounds[3] + FIX_LAT_OFFSET, bounds[2] + FIX_LON_OFFSET]  # North-East
                 ]
                 
                 # 贴图
@@ -177,7 +178,7 @@ with col_map:
                 try: os.remove(temp_png)
                 except: pass
                 
-                # === 恢复分级图例 ===
+                # === 分级图例 ===
                 legend_html = '''
                 <div style="position: fixed; 
                             bottom: 30px; right: 10px; width: 150px;
