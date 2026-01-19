@@ -7,6 +7,10 @@ import os
 import numpy as np
 import pandas as pd
 import altair as alt
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import folium
 
 # ==========================================
 # 1. 基础设置
@@ -21,7 +25,6 @@ USER_NAME = "nuanqituan"
 REPO_NAME = "inner-mongolia-drought"
 DATA_PATH = "data" 
 
-# 矢量文件路径
 LEAGUE_PATH = f"{DATA_PATH}/inner_mongolia_city.json"      
 BANNER_PATH = f"{DATA_PATH}/inner_mongolia_banners.json"   
 BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json" 
@@ -42,11 +45,11 @@ if leagues_gdf is None:
     st.stop()
 
 # ==========================================
-# 3. 左侧控制面板 (Sidebar)
+# 3. 左侧控制面板
 # ==========================================
 st.sidebar.header("🕹️ 参数选择")
 
-# --- A. 区域选择 ---
+# --- 区域选择 ---
 league_names = sorted(leagues_gdf['name'].unique())
 selected_league = st.sidebar.selectbox("📍 选择盟市", ["全区概览"] + list(league_names))
 
@@ -75,7 +78,7 @@ if selected_league != "全区概览":
         center = [centroid.y.values[0], centroid.x.values[0]]
         zoom_level = 6
 
-# --- B. 时间选择 ---
+# --- 时间选择 ---
 st.sidebar.markdown("---")
 scale_display = st.sidebar.selectbox("📊 SPEI 尺度", ["1个月 (气象干旱)", "3个月 (农业干旱)", "12个月 (水文干旱)"])
 scale_map = {"1个月 (气象干旱)": "01", "3个月 (农业干旱)": "03", "12个月 (水文干旱)": "12"}
@@ -87,147 +90,170 @@ sel_month = st.sidebar.select_slider("🗓️ 月份", range(1, 13), 8)
 month_str = f"{sel_month:02d}"
 tif_file = f"{DATA_PATH}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 
-
 # ==========================================
-# 布局分割：地图区 vs 统计区
+# 4. 布局结构 (左右分栏)
 # ==========================================
-# 创建两列：左边宽(地图)，右边窄(统计)
-# ratio=[3, 1] 表示地图占 75%，统计占 25%
 col_map, col_stats = st.columns([3, 1])
 
-
 # ==========================================
-# 4. 地图展示 (放入左侧大列 col_map)
+# 5. 地图展示核心逻辑 (PNG贴图 + 原始坐标)
 # ==========================================
 with col_map:
     st.subheader(f"🗺️ 分析视图: {selected_league}")
-    
-    # 创建地图
     m = leafmap.Map(center=center, zoom=zoom_level, locate_control=False, draw_control=False)
 
-    # 1. 显示内蒙古轮廓
+    # 显示边界
     try:
         m.add_geojson(BOUNDARY_PATH, layer_name="内蒙古轮廓", 
                       style={"fillOpacity": 0, "color": "#333333", "weight": 2})
     except: pass
 
-    # 2. 加载SPEI数据
     if not os.path.exists(tif_file):
-        st.warning(f"⚠️ 暂无该月份数据: {tif_file}")
+        st.warning(f"⚠️ 暂无该月份数据")
     else:
         try:
-            # === 读取栅格数据 ===
+            # === 读取数据 ===
             xds = rioxarray.open_rasterio(tif_file)
             
-            # 裁剪 (如果选了区域)
+            # 【重要调整】: 不再强制重投影，保持原始坐标系，避免变形
+            # 如果原始数据没有坐标系，才赋予 EPSG:4326
+            if xds.rio.crs is None:
+                xds = xds.rio.write_crs("EPSG:4326")
+
+            # 裁剪
             if selected_geom is not None:
                 try:
                     xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
-                    # 添加选中区域边界
                     m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
-                              layer_name="选中区域", 
-                              style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
+                              layer_name="选中区域", style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
                 except:
-                    st.warning("区域边缘裁剪微调...")
+                    pass
 
-            # === 关键步骤：处理数据以去除红色背景 ===
-            xds_masked = xds.where(xds > -10)
+            # === 数据处理 (生成PNG) ===
+            data = xds.values[0]
+            data_clean = np.where(data > -10, data, np.nan)
+            valid_mask = ~np.isnan(data_clean)
             
-            # 保存临时文件
-            temp_tif = "temp_display.tif"
-            xds_masked.rio.to_raster(temp_tif)
-            
-            # === 使用 add_raster ===
-            m.add_raster(
-                temp_tif,
-                layer_name="SPEI干旱指数",
-                colormap='RdBu',
-                vmin=-3,
-                vmax=3,
-                nodata=np.nan
-            )
-            
-            # 清理
-            try: os.remove(temp_tif)
-            except: pass
-            
-            # 添加图例
-            m.add_colormap(label="SPEI Index", vmin=-3, vmax=3, palette='RdBu')
+            if np.any(valid_mask):
+                # 渲染颜色
+                cmap = plt.cm.RdBu
+                norm = mcolors.Normalize(vmin=-3, vmax=3)
+                rgba_array = cmap(norm(data_clean))
+                rgba_array[..., 3] = np.where(valid_mask, 1.0, 0.0) # 透明度
+                
+                img = Image.fromarray((rgba_array * 255).astype(np.uint8), mode='RGBA')
+                temp_png = "temp_spei_visual.png"
+                img.save(temp_png, format='PNG')
+                
+                # === 坐标系统 (加回微调功能，以防万一) ===
+                bounds = xds.rio.bounds() # (minx, miny, maxx, maxy)
+                
+                # 隐藏的微调器：如果位置还不对，点开这个expander手动调
+                with st.expander("🛠️ 地图对齐微调 (如果位置有偏差请点我)", expanded=False):
+                    lat_offset = st.slider("↕️ 南北偏移", -0.5, 0.5, 0.0, 0.05)
+                    lon_offset = st.slider("↔️ 东西偏移", -0.5, 0.5, 0.0, 0.05)
+                
+                # 应用坐标 (原始坐标 + 微调量)
+                # Folium顺序: [[LatMin, LonMin], [LatMax, LonMax]] => [[South, West], [North, East]]
+                # xds.bounds 是 (West, South, East, North)
+                leaflet_bounds = [
+                    [bounds[1] + lat_offset, bounds[0] + lon_offset], 
+                    [bounds[3] + lat_offset, bounds[2] + lon_offset]
+                ]
+                
+                # 贴图
+                img_overlay = folium.raster_layers.ImageOverlay(
+                    image=temp_png,
+                    bounds=leaflet_bounds,
+                    opacity=0.85,
+                    interactive=True,
+                    cross_origin=False,
+                    zindex=1,
+                    name='SPEI干旱指数'
+                )
+                img_overlay.add_to(m)
+                
+                # 清理
+                try: os.remove(temp_png)
+                except: pass
+                
+                # === 恢复分级图例 ===
+                legend_html = '''
+                <div style="position: fixed; 
+                            bottom: 30px; right: 10px; width: 150px;
+                            background-color: white; z-index:9999; font-size:12px;
+                            border:2px solid grey; border-radius: 5px; padding: 10px">
+                    <p style="margin:0; font-weight:bold; text-align:center;">SPEI干旱等级</p>
+                    <p style="margin:2px;"><span style="background:#ca0020; padding:0px 8px;">&nbsp;</span> 极端干旱 (&lt;-2)</p>
+                    <p style="margin:2px;"><span style="background:#f4a582; padding:0px 8px;">&nbsp;</span> 严重干旱</p>
+                    <p style="margin:2px;"><span style="background:#fddbc7; padding:0px 8px;">&nbsp;</span> 中度干旱</p>
+                    <p style="margin:2px;"><span style="background:#f7f7f7; padding:0px 8px;">&nbsp;</span> 正常</p>
+                    <p style="margin:2px;"><span style="background:#d1e5f0; padding:0px 8px;">&nbsp;</span> 中度湿润</p>
+                    <p style="margin:2px;"><span style="background:#92c5de; padding:0px 8px;">&nbsp;</span> 严重湿润</p>
+                    <p style="margin:2px;"><span style="background:#0571b0; padding:0px 8px;">&nbsp;</span> 极端湿润 (&gt;2)</p>
+                </div>
+                '''
+                m.get_root().html.add_child(folium.Element(legend_html))
+            else:
+                st.warning("无有效数据区域")
 
         except Exception as e:
-            st.error(f"❌ 数据加载出错: {e}")
+            st.error(f"地图渲染错误: {e}")
 
-    # 显示地图 (高度稍微调高一点以匹配右侧内容)
     m.to_streamlit(height=700)
 
-
 # ==========================================
-# 5. 统计信息面板 (放入右侧小列 col_stats)
+# 6. 统计信息 (右侧栏)
 # ==========================================
 with col_stats:
     st.markdown("### 📊 统计概览")
-    st.write(f"**时间**: {sel_year}年{sel_month}月")
-    
     if os.path.exists(tif_file):
         try:
-            # 读取并计算统计数据
+            # 独立读取统计数据
             xds_stats = rioxarray.open_rasterio(tif_file)
             if selected_geom is not None:
                 xds_stats = xds_stats.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
             
-            data_stats = xds_stats.values[0]
-            data_stats = np.where(data_stats > -10, data_stats, np.nan)
-            valid = data_stats[~np.isnan(data_stats)]
+            data_s = xds_stats.values[0]
+            valid = data_s[(data_s > -10) & (~np.isnan(data_s))]
             
             if len(valid) > 0:
-                # --- 基础数值 (使用两列布局，防止在窄栏中挤压) ---
-                st.markdown("#### 📉 基础指标")
+                # 基础数值
                 c1, c2 = st.columns(2)
-                c1.metric("最小值", f"{np.min(valid):.2f}")
-                c2.metric("最大值", f"{np.max(valid):.2f}")
+                c1.metric("最低", f"{np.min(valid):.2f}")
+                c2.metric("最高", f"{np.max(valid):.2f}")
+                st.metric("平均SPEI", f"{np.mean(valid):.2f}")
                 
-                c3, c4 = st.columns(2)
-                c3.metric("平均值", f"{np.mean(valid):.2f}")
-                c4.metric("像素数", f"{len(valid)}")
+                # 等级统计
+                cnts = {
+                    '极端干旱': int(np.sum(valid < -2)),
+                    '严重干旱': int(np.sum((valid >= -2) & (valid < -1.5))),
+                    '中度干旱': int(np.sum((valid >= -1.5) & (valid < -1))),
+                    '正常': int(np.sum((valid >= -1) & (valid <= 1))),
+                    '湿润': int(np.sum(valid > 1))
+                }
                 
-                # --- 干旱等级分布 ---
-                st.markdown("---")
-                st.markdown("#### 🌵 等级占比")
-                
-                # 计算数量
-                extreme_drought = int(np.sum(valid < -2))
-                severe_drought = int(np.sum((valid >= -2) & (valid < -1.5)))
-                moderate_drought = int(np.sum((valid >= -1.5) & (valid < -1)))
-                normal = int(np.sum((valid >= -1) & (valid <= 1)))
-                wet = int(np.sum(valid > 1))
-                
-                # Altair 统计图 (调整为垂直方向更适合侧边)
-                chart_data = pd.DataFrame({
-                    '等级': ['极端干旱', '严重干旱', '中度干旱', '正常', '湿润'],
-                    '像素数': [extreme_drought, severe_drought, moderate_drought, normal, wet],
+                # Altair 柱状图
+                df_chart = pd.DataFrame({
+                    '等级': list(cnts.keys()),
+                    '像素': list(cnts.values()),
                     '颜色': ['#ca0020', '#f4a582', '#fddbc7', '#f7f7f7', '#0571b0']
                 })
                 
-                # 创建图表 (去掉 X 轴标题以节省空间)
-                chart = alt.Chart(chart_data).mark_bar().encode(
-                    x=alt.X('像素数', title=None), 
+                chart = alt.Chart(df_chart).mark_bar().encode(
+                    x=alt.X('像素', title=None),
                     y=alt.Y('等级', sort=None, title=None),
                     color=alt.Color('颜色', scale=None, legend=None),
-                    tooltip=['等级', '像素数']
-                ).properties(
-                    height=250 # 高度适中
-                )
+                    tooltip=['等级', '像素']
+                ).properties(height=250)
                 
+                st.markdown("#### 🌵 面积占比")
                 st.altair_chart(chart, use_container_width=True)
-
-                # 以文字列表形式补充具体占比 (因为图表没地方显示百分比)
-                total = len(valid)
-                st.caption(f"🔴 极端干旱: {100*extreme_drought/total:.1f}%")
-                st.caption(f"🟠 严重干旱: {100*severe_drought/total:.1f}%")
-                st.caption(f"🟡 中度干旱: {100*moderate_drought/total:.1f}%")
                 
-        except Exception as e:
-            st.info("统计数据计算中...")
-            # st.error(f"{e}") # 调试用
-    else:
-        st.write("暂无数据")
+                # 文字占比
+                total = len(valid)
+                st.caption(f"🔴 极端干旱: {100*cnts['极端干旱']/total:.1f}%")
+                st.caption(f"🟠 严重干旱: {100*cnts['严重干旱']/total:.1f}%")
+                
+        except:
+            st.info("统计计算中...")
