@@ -2,6 +2,7 @@ import streamlit as st
 import leafmap.foliumap as leafmap
 import geopandas as gpd
 import rioxarray
+import xarray as xr # 引入 xarray 处理数据
 import os
 
 # ==========================================
@@ -14,14 +15,11 @@ st.title("内蒙古干旱监测与预警系统")
 # 2. 数据连接配置
 # ==========================================
 # ！！！请务必修改下面这一行，换成你自己的 GitHub 用户名！！！
-# 例如: USER_NAME = "nuanqituan"
 USER_NAME = "nuanqituan" 
 REPO_NAME = "inner-mongolia-drought"
 
-# 自动生成数据仓库地址
 REPO_URL = f"https://raw.githubusercontent.com/{USER_NAME}/{REPO_NAME}/main/data"
 
-# 你的三个核心矢量文件
 LEAGUE_URL = f"{REPO_URL}/inner_mongolia_city.json"      
 BANNER_URL = f"{REPO_URL}/inner_mongolia_banners.json"   
 BOUNDARY_URL = f"{REPO_URL}/inner_mongolia_boundary.json" 
@@ -38,7 +36,7 @@ def load_data():
 leagues_gdf, banners_gdf = load_data()
 
 if leagues_gdf is None or banners_gdf is None:
-    st.error(f"❌ 数据加载失败！请检查 GitHub 用户名 '{USER_NAME}' 是否正确，且仓库是 Public 公开状态。")
+    st.error(f"❌ 数据加载失败！请检查 GitHub 用户名 '{USER_NAME}' 是否正确。")
     st.stop()
 
 # ==========================================
@@ -58,7 +56,6 @@ if selected_league != "全区概览":
     league_feature = leagues_gdf[leagues_gdf['name'] == selected_league]
     selected_geom = league_feature.unary_union
     
-    # 筛选旗县 (使用 ParentCity 字段)
     filtered_banners = banners_gdf[banners_gdf['ParentCity'] == selected_league]
     banner_names = sorted(filtered_banners['name'].unique())
     
@@ -94,7 +91,9 @@ tif_url = f"{REPO_URL}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 st.subheader(f"分析视图: {selected_league} - {sel_year}年{sel_month}月")
 
 m = leafmap.Map(center=center, zoom=zoom_level)
-vis_params = {'min': -2.5, 'max': 2.5, 'palette': 'RdBu'}
+# SPEI通常在 -2.5 到 2.5 之间。我们在 ArcGIS 截图里看到有 -8.2 的极端值。
+# 这里把范围稍微调大一点，避免极端值颜色饱和
+vis_params = {'min': -3.0, 'max': 3.0, 'palette': 'RdBu'}
 
 # 1. 显示内蒙古轮廓
 try:
@@ -102,23 +101,33 @@ try:
 except:
     pass 
 
-# 2. 加载数据 (修复全红问题的关键部分)
+# 2. 加载数据
 if selected_geom is not None:
+    # === 局部裁剪模式 ===
     try:
-        with st.spinner('正在读取数据...'):
-            # 【关键修复】masked=True 会自动把无效值(-9999)变成透明
-            xds = rioxarray.open_rasterio(tif_url, masked=True)
+        with st.spinner('正在处理数据...'):
+            # 读取数据
+            xds = rioxarray.open_rasterio(tif_url)
             
-            # --- 数据侦探：在左侧显示当前数据的最大最小值，帮你判断数据是否正常 ---
-            try:
-                valid_min = float(xds.min())
-                valid_max = float(xds.max())
-                st.sidebar.info(f"🔍 数据侦探:\n当前区域最小值: {valid_min:.2f}\n当前区域最大值: {valid_max:.2f}")
-            except:
-                st.sidebar.warning("数据全为空，可能是该月份没有数据")
+            # 【核心修复代码 START】
+            # ArcGIS 显示正常是因为它自动过滤了 -9999。
+            # 这里我们手动操作：只要小于 -10 的数值，统统变成 NaN (透明)
+            # SPEI 指数不可能小于 -10，所以这很安全。
+            xds = xds.where(xds > -10)
+            # 【核心修复代码 END】
 
-            # 裁剪并显示
+            # 裁剪
             clipped = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
+            
+            # 数据侦探：看看现在真正的最大最小值是多少
+            try:
+                valid_min = float(clipped.min())
+                valid_max = float(clipped.max())
+                st.sidebar.success(f"🔍 数据侦探 (已过滤背景):\n最小值: {valid_min:.2f}\n最大值: {valid_max:.2f}")
+            except:
+                pass
+
+            # 保存并显示
             temp_file = "temp_clipped.tif"
             clipped.rio.to_raster(temp_file)
             m.add_raster(temp_file, layer_name="局部干旱等级", **vis_params)
@@ -128,13 +137,28 @@ if selected_geom is not None:
                       layer_name="选中区域边界", style={"fillOpacity": 0, "color": "blue", "weight": 2})
             
     except Exception as e:
-        st.warning(f"⚠️ 无法加载该区域数据 (可能是该年份数据缺失)。")
+        st.warning(f"无法加载数据，可能该月数据缺失或网络超时。")
 else:
-    # 全图模式
-    # 这里我们不用 clipped，直接加载，但可能无法自动 mask，建议主要查看局部
-    m.add_cog_layer(tif_url, name="全区数据", **vis_params)
+    # === 全图概览模式 ===
+    # 注意：为了解决全图变红，全图模式也必须下载-过滤-保存，不能直接用 add_cog_layer
+    try:
+        with st.spinner('正在加载全区数据...'):
+            xds = rioxarray.open_rasterio(tif_url)
+            
+            # 【核心修复】过滤背景
+            xds = xds.where(xds > -10)
+            
+            temp_file = "temp_full.tif"
+            xds.rio.to_raster(temp_file)
+            m.add_raster(temp_file, layer_name="全区干旱等级", **vis_params)
+    except:
+         st.warning("全区数据加载超时，请尝试选择具体的盟市或旗县。")
 
-# 【临时禁用图例条，防止报错】
-# m.add_colormap('RdBu', vmin=-2.5, vmax=2.5, label="SPEI Index")
+
+# 尝试添加图例 (如果不报错的话)
+try:
+    m.add_colormap('RdBu', vmin=-3.0, vmax=3.0, label="SPEI Index")
+except:
+    pass
 
 m.to_streamlit(height=650)

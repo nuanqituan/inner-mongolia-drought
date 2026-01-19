@@ -3,4 +3,4 @@ leafmap
 geopandas
 rioxarray
 rasterio
-matplotlib
+xarray
