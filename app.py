@@ -32,9 +32,9 @@ BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json"
 # === 🎯 坐标硬校准 (根据您的反馈) ===
 # 现象：地图整体偏北 2 个像元
 # 分辨率：0.25度
-# 修正计算：2 * 0.25 = 0.5度
-# 修正方向：向下（向南），即 纬度减去 0.5
-FIX_LAT_OFFSET = -0.5  # 向南平移 0.5 度
+# 修正计算： 0.25 = 0.5度
+# 修正方向：向下（向南），即 纬度减去 0.25
+FIX_LAT_OFFSET = -0.25  # 向南平移 0.5 度
 FIX_LON_OFFSET = 0.0   # 经度保持不变
 
 @st.cache_data
