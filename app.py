@@ -4,10 +4,7 @@ import geopandas as gpd
 import rioxarray
 import xarray as xr
 import os
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
-from PIL import Image
 
 # ==========================================
 # 1. 基础设置
@@ -26,14 +23,6 @@ DATA_PATH = "data"
 LEAGUE_PATH = f"{DATA_PATH}/inner_mongolia_city.json"      
 BANNER_PATH = f"{DATA_PATH}/inner_mongolia_banners.json"   
 BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json" 
-
-# === 🛠️ 核心修正：针对 0.25° 分辨率数据的自动校准 ===
-# 您提到数据分辨率是 0.25°，且地图整体偏北。
-# 这是经典的 "Center vs Corner" 像素配准问题。
-# 我们需要将图像向南（下）移动半个像素，即 0.125°。
-# 如果发现还有左右偏移，可以修改 LON_SHIFT。
-LAT_SHIFT = -0.125  # 向南移 0.125 度 (解决北移问题)
-LON_SHIFT = 0.0     # 经度暂不调整 (如果有东移/西移，可改为 -0.125 或 0.125)
 
 @st.cache_data
 def load_data():
@@ -97,17 +86,27 @@ month_str = f"{sel_month:02d}"
 tif_file = f"{DATA_PATH}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 
 # ==========================================
-# 4. 地图展示核心逻辑 (自动校准版)
+# 4. 地图展示核心逻辑 (使用原始代码的正确方法)
 # ==========================================
 st.subheader(f"分析视图: {selected_league} - {sel_year}年{sel_month}月")
 
-# 创建地图
-m = leafmap.Map(center=center, zoom=zoom_level, locate_control=False, draw_control=False)
+# 可视化参数
+vis_params = {
+    'min': -3, 
+    'max': 3, 
+    'palette': 'RdBu'  # 红=干旱, 蓝=湿润
+}
 
-# 1. 显示内蒙古轮廓
+# 创建地图
+m = leafmap.Map(center=center, zoom=zoom_level)
+
+# 1. 始终显示内蒙古轮廓
 try:
-    m.add_geojson(BOUNDARY_PATH, layer_name="内蒙古轮廓", 
-                  style={"fillOpacity": 0, "color": "#333333", "weight": 2})
+    m.add_geojson(
+        BOUNDARY_PATH, 
+        layer_name="内蒙古轮廓", 
+        style={"fillOpacity": 0, "color": "#333333", "weight": 2}
+    )
 except: 
     pass
 
@@ -116,131 +115,167 @@ if not os.path.exists(tif_file):
     st.warning(f"⚠️ 暂无该月份数据: {tif_file}")
 else:
     try:
-        # === 读取栅格数据 ===
-        xds = rioxarray.open_rasterio(tif_file)
-        
-        # 强制坐标系 (确保为 WGS84)
-        if xds.rio.crs is None or xds.rio.crs.to_string() != "EPSG:4326":
-             xds = xds.rio.write_crs("EPSG:4326")
-
-        # 裁剪 (如果选了区域)
+        # === 方法A: 如果选择了区域,进行裁剪 ===
         if selected_geom is not None:
-            # 注意：裁剪时也要考虑偏移，但为了简单，我们先裁剪再贴图
-            # 如果裁剪边缘有白边，说明需要先平移再裁剪。
-            # 这里我们保持逻辑简单：先裁剪出大致范围
-            xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
-            
-            # 添加选中区域边界
-            m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
-                      layer_name="选中区域", 
-                      style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
+            with st.spinner('📊 正在处理区域数据...'):
+                # 读取并裁剪
+                xds = rioxarray.open_rasterio(tif_file)
+                
+                # 数据统计(裁剪前)
+                data_before = xds.values[0]
+                valid_before = data_before[(data_before > -10) & (~np.isnan(data_before))]
+                st.sidebar.info(f"🗺️ 原始数据: {len(valid_before)} 像素")
+                
+                # 裁剪到选中区域
+                clipped = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
+                
+                # 数据统计(裁剪后)
+                data_after = clipped.values[0]
+                valid_after = data_after[(data_after > -10) & (~np.isnan(data_after))]
+                
+                if len(valid_after) == 0:
+                    st.error("❌ 该区域当前时段无有效数据!")
+                else:
+                    st.sidebar.success(f"✂️ 裁剪后: {len(valid_after)} 像素")
+                    st.sidebar.info(f"📈 SPEI范围: {np.min(valid_after):.2f} ~ {np.max(valid_after):.2f}")
+                    
+                    # 保存临时文件
+                    temp_file = "temp_clipped.tif"
+                    clipped.rio.to_raster(temp_file)
+                    
+                    # 使用 leafmap 的 add_raster 方法 (关键!)
+                    m.add_raster(
+                        temp_file, 
+                        layer_name="SPEI干旱指数",
+                        colormap='RdBu',
+                        vmin=-3,
+                        vmax=3
+                    )
+                    
+                    # 清理临时文件
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                    
+                    # 添加选中区域边框
+                    m.add_gdf(
+                        gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
+                        layer_name="选中区域边界", 
+                        style={"fillOpacity": 0, "color": "#0066ff", "weight": 3}
+                    )
+                    
+                    st.success("✅ 区域数据加载成功!")
         
-        # === 数据处理 ===
-        data = xds.values[0]  
-        
-        # 过滤无效值
-        data_clean = np.where(data > -10, data, np.nan)
-        valid_mask = ~np.isnan(data_clean)
-        
-        if not np.any(valid_mask):
-            st.error("❌ 该区域当前月份无有效数据!")
+        # === 方法B: 全区显示 ===
         else:
-            # === 生成图片 ===
-            cmap = plt.cm.RdBu
-            norm = mcolors.Normalize(vmin=-3, vmax=3)
-            rgba_array = cmap(norm(data_clean))
+            # 数据统计
+            xds = rioxarray.open_rasterio(tif_file)
+            data = xds.values[0]
+            valid_data = data[(data > -10) & (~np.isnan(data))]
             
-            # 透明度处理
-            alpha_channel = np.where(valid_mask, 1.0, 0.0) 
-            rgba_array[..., 3] = alpha_channel
+            if len(valid_data) > 0:
+                st.sidebar.success(f"✅ 有效像素: {len(valid_data)}")
+                st.sidebar.info(f"📊 SPEI范围: {np.min(valid_data):.2f} ~ {np.max(valid_data):.2f}")
             
-            # 转换为图片对象
-            img = Image.fromarray((rgba_array * 255).astype(np.uint8), mode='RGBA')
-            temp_png = "temp_spei_overlay.png"
-            img.save(temp_png, format='PNG')
-            
-            # === 🎯 自动校准坐标 ===
-            bounds = xds.rio.bounds() # (minx, miny, maxx, maxy)
-            
-            # 应用 0.125° 的自动修正
-            # bounds[1] 是南边界，bounds[3] 是北边界 -> 加上负数(LAT_SHIFT)等于向南移
-            # bounds[0] 是西边界，bounds[2] 是东边界 -> 加上 LON_SHIFT
-            corrected_bounds = [
-                [bounds[1] + LAT_SHIFT, bounds[0] + LON_SHIFT], # [南, 西]
-                [bounds[3] + LAT_SHIFT, bounds[2] + LON_SHIFT]  # [北, 东]
-            ]
-            
-            # 贴图
-            import folium
-            img_overlay = folium.raster_layers.ImageOverlay(
-                image=temp_png,
-                bounds=corrected_bounds, # 使用修正后的坐标
-                opacity=0.85,
-                interactive=True,
-                cross_origin=False,
-                zindex=1,
-                name='SPEI干旱指数'
+            # 直接使用 add_raster 显示全图
+            m.add_raster(
+                tif_file,
+                layer_name="SPEI干旱指数",
+                colormap='RdBu',
+                vmin=-3,
+                vmax=3
             )
-            img_overlay.add_to(m)
             
-            # 清理
-            try: os.remove(temp_png)
-            except: pass
+            st.success("✅ 全区数据加载成功!")
+        
+        # 添加图例
+        m.add_colormap(
+            cmap='RdBu',
+            vmin=-3,
+            vmax=3,
+            label="SPEI干旱指数"
+        )
+        
+        # 添加自定义图例说明
+        legend_dict = {
+            '极端湿润 (>2)': '#0571b0',
+            '严重湿润 (1.5~2)': '#92c5de',
+            '中度湿润 (1~1.5)': '#d1e5f0',
+            '正常 (-1~1)': '#f7f7f7',
+            '中度干旱 (-1.5~-1)': '#fddbc7',
+            '严重干旱 (-2~-1.5)': '#f4a582',
+            '极端干旱 (<-2)': '#ca0020'
+        }
+        try:
+            m.add_legend(title="干旱等级", legend_dict=legend_dict, position='bottomright')
+        except:
+            pass
             
-            # === 添加图例 ===
-            legend_html = '''
-            <div style="position: fixed; 
-                        bottom: 50px; right: 50px; width: 200px;
-                        background-color: white; z-index:9999; font-size:14px;
-                        border:2px solid grey; border-radius: 5px; padding: 10px">
-                <p style="margin:0; font-weight:bold; text-align:center;">SPEI干旱等级</p>
-                <p style="margin:5px 0;"><span style="background:#ca0020; padding:2px 10px;">&nbsp;&nbsp;</span> 极端干旱 (&lt;-2)</p>
-                <p style="margin:5px 0;"><span style="background:#f4a582; padding:2px 10px;">&nbsp;&nbsp;</span> 严重干旱 (-2~-1.5)</p>
-                <p style="margin:5px 0;"><span style="background:#fddbc7; padding:2px 10px;">&nbsp;&nbsp;</span> 中度干旱 (-1.5~-1)</p>
-                <p style="margin:5px 0;"><span style="background:#f7f7f7; padding:2px 10px;">&nbsp;&nbsp;</span> 正常 (-1~1)</p>
-                <p style="margin:5px 0;"><span style="background:#d1e5f0; padding:2px 10px;">&nbsp;&nbsp;</span> 中度湿润 (1~1.5)</p>
-                <p style="margin:5px 0;"><span style="background:#92c5de; padding:2px 10px;">&nbsp;&nbsp;</span> 严重湿润 (1.5~2)</p>
-                <p style="margin:5px 0;"><span style="background:#0571b0; padding:2px 10px;">&nbsp;&nbsp;</span> 极端湿润 (&gt;2)</p>
-            </div>
-            '''
-            m.get_root().html.add_child(folium.Element(legend_html))
-
     except Exception as e:
-        st.error(f"❌ 数据处理出错: {e}")
+        st.error(f"❌ 数据加载失败: {e}")
+        import traceback
+        with st.expander("🔍 查看详细错误"):
+            st.code(traceback.format_exc())
 
 # 显示地图
 m.to_streamlit(height=650)
 
 # ==========================================
-# 5. 统计信息面板 (保持不变)
+# 5. 统计信息面板
 # ==========================================
 if os.path.exists(tif_file):
+    st.markdown("---")
+    st.markdown("### 📊 统计信息")
+    
     try:
+        # 读取数据
         xds_stats = rioxarray.open_rasterio(tif_file)
+        
+        # 如果选了区域就裁剪
         if selected_geom is not None:
             xds_stats = xds_stats.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
         
+        # 数据处理
         data_stats = xds_stats.values[0]
         data_stats = np.where(data_stats > -10, data_stats, np.nan)
         valid = data_stats[~np.isnan(data_stats)]
         
         if len(valid) > 0:
-            st.markdown("---")
-            st.markdown("### 📊 统计信息")
+            # 基础统计
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("最小值", f"{np.min(valid):.2f}")
             col2.metric("平均值", f"{np.mean(valid):.2f}")
             col3.metric("最大值", f"{np.max(valid):.2f}")
             col4.metric("有效像素", f"{len(valid)}")
             
+            # 干旱等级统计
             extreme_drought = np.sum(valid < -2)
             severe_drought = np.sum((valid >= -2) & (valid < -1.5))
             moderate_drought = np.sum((valid >= -1.5) & (valid < -1))
+            normal = np.sum((valid >= -1) & (valid <= 1))
+            wet = np.sum(valid > 1)
             
-            st.markdown("### 🌵 干旱面积占比")
-            d1, d2, d3 = st.columns(3)
-            d1.metric("极端干旱", f"{100*extreme_drought/len(valid):.1f}%", delta_color="inverse")
-            d2.metric("严重干旱", f"{100*severe_drought/len(valid):.1f}%", delta_color="inverse")
-            d3.metric("中度干旱", f"{100*moderate_drought/len(valid):.1f}%", delta_color="inverse")
-    except:
-        pass
+            st.markdown("### 🌵 干旱等级分布")
+            
+            col_a, col_b, col_c, col_d, col_e = st.columns(5)
+            col_a.metric("极端干旱", f"{100*extreme_drought/len(valid):.1f}%")
+            col_b.metric("严重干旱", f"{100*severe_drought/len(valid):.1f}%")
+            col_c.metric("中度干旱", f"{100*moderate_drought/len(valid):.1f}%")
+            col_d.metric("正常", f"{100*normal/len(valid):.1f}%")
+            col_e.metric("湿润", f"{100*wet/len(valid):.1f}%")
+            
+            # 可视化分布
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(10, 3))
+            
+            categories = ['极端干旱', '严重干旱', '中度干旱', '正常', '湿润']
+            values = [extreme_drought, severe_drought, moderate_drought, normal, wet]
+            colors = ['#ca0020', '#f4a582', '#fddbc7', '#f7f7f7', '#0571b0']
+            
+            ax.barh(categories, values, color=colors)
+            ax.set_xlabel('像素数量')
+            ax.set_title('干旱等级分布')
+            
+            st.pyplot(fig)
+            
+    except Exception as e:
+        st.info("统计信息计算中...")
