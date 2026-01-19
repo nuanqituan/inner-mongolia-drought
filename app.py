@@ -143,5 +143,5 @@ else:
     m.add_cog_layer(tif_url, name="全区数据", **vis_params)
 
 # 添加图例
-m.add_colormap('RdBu', vmin=-2.5, vmax=2.5, label="SPEI Index")
+# m.add_colormap('RdBu', vmin=-2.5, vmax=2.5, label="SPEI Index")
 m.to_streamlit(height=650)
