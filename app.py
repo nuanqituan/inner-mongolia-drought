@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import leafmap.foliumap as leafmap
 import geopandas as gpd
 import rioxarray
@@ -15,7 +15,7 @@ st.title("内蒙古干旱监测与预警系统")
 # ==========================================
 # ！！！请在这里填入你的 GitHub 用户名！！！
 # 例如: USER_NAME = "gel1988918"
-USER_NAME = "你的GitHub用户名" 
+USER_NAME = "nuanqituan" 
 REPO_NAME = "inner-mongolia-drought"
 
 # 自动生成数据仓库地址
@@ -47,12 +47,12 @@ if leagues_gdf is None or banners_gdf is None:
 # ==========================================
 # 3. 左侧控制面板
 # ==========================================
-st.sidebar.header("🕹️ 参数选择")
+st.sidebar.header("ðﾟﾕﾹ️ 参数选择")
 
 # --- A. 区域选择 (级联逻辑) ---
 # 1. 获取盟市列表 (按照你的截图，字段名是 'name')
 league_names = sorted(leagues_gdf['name'].unique())
-selected_league = st.sidebar.selectbox("📍 选择盟市", ["全区概览"] + list(league_names))
+selected_league = st.sidebar.selectbox("ðﾟﾓﾍ 选择盟市", ["全区概览"] + list(league_names))
 
 selected_geom = None
 zoom_level = 5
@@ -68,7 +68,7 @@ if selected_league != "全区概览":
     filtered_banners = banners_gdf[banners_gdf['ParentCity'] == selected_league]
     banner_names = sorted(filtered_banners['name'].unique())
     
-    selected_banner = st.sidebar.selectbox("🚩 选择旗县 (可选)", ["全盟市"] + list(banner_names))
+    selected_banner = st.sidebar.selectbox("ðﾟﾚﾩ 选择旗县 (可选)", ["全盟市"] + list(banner_names))
     
     if selected_banner != "全盟市":
         # 选了具体旗县
@@ -87,12 +87,12 @@ if selected_league != "全区概览":
 
 # --- B. 时间选择 ---
 st.sidebar.markdown("---")
-scale_display = st.sidebar.selectbox("📊 SPEI 尺度", ["1个月 (气象干旱)", "3个月 (农业干旱)", "12个月 (水文干旱)"])
+scale_display = st.sidebar.selectbox("ðﾟﾓﾊ SPEI 尺度", ["1个月 (气象干旱)", "3个月 (农业干旱)", "12个月 (水文干旱)"])
 scale_map = {"1个月 (气象干旱)": "01", "3个月 (农业干旱)": "03", "12个月 (水文干旱)": "12"}
 sel_scale = scale_map[scale_display]
 
-sel_year = st.sidebar.slider("📅 年份", 1950, 2025, 2024)
-sel_month = st.sidebar.select_slider("🗓️ 月份", range(1, 13), 8)
+sel_year = st.sidebar.slider("ðﾟﾓﾅ 年份", 1950, 2025, 2024)
+sel_month = st.sidebar.select_slider("ðﾟﾗﾓ️ 月份", range(1, 13), 8)
 
 # 构造 TIFF 文件链接 (文件名格式必须是: SPEI_01_2024_08.tif)
 month_str = f"{sel_month:02d}"
