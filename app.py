@@ -112,8 +112,17 @@ else:
         # === 读取栅格数据 ===
         xds = rioxarray.open_rasterio(tif_file)
         
+        # 检查并修复坐标系
+        if xds.rio.crs is None:
+            st.warning("⚠️ TIF文件缺少坐标系,假设为 EPSG:4326")
+            xds = xds.rio.write_crs("EPSG:4326")
+        elif xds.rio.crs.to_string() != "EPSG:4326":
+            st.info(f"🔄 正在转换坐标系: {xds.rio.crs.to_string()} → EPSG:4326")
+            xds = xds.rio.reproject("EPSG:4326")
+        
         # 获取原始边界
         original_bounds = xds.rio.bounds()
+        st.sidebar.info(f"🗺️ 数据边界: 经度 [{original_bounds[0]:.2f}, {original_bounds[2]:.2f}], 纬度 [{original_bounds[1]:.2f}, {original_bounds[3]:.2f}]")
         
         # 裁剪 (如果选了区域)
         if selected_geom is not None:
@@ -149,11 +158,16 @@ else:
             rgba_array = cmap(norm(data_clean))
             
             # 3. 设置透明度: 有效数据=不透明, 背景=透明
-            alpha_channel = np.where(valid_mask, 0.75, 0.0)  # 75%不透明度
+            alpha_channel = np.where(valid_mask, 0.7, 0.0)  # 70%不透明度
             rgba_array[..., 3] = alpha_channel
             
             # 4. 翻转Y轴 (重要! leaflet坐标系与numpy相反)
-            rgba_array = np.flipud(rgba_array)
+            # 注意: 只有当数据是从北到南排列时才需要翻转
+            # 检查Y坐标是递增还是递减
+            y_coords = xds.y.values
+            if y_coords[0] < y_coords[-1]:  # 如果是从南到北(递增),需要翻转
+                rgba_array = np.flipud(rgba_array)
+                st.sidebar.write("🔄 已翻转Y轴(南→北)")
             
             # 5. 转换为图片
             from PIL import Image
@@ -164,9 +178,18 @@ else:
             temp_png = "temp_spei_overlay.png"
             img.save(temp_png, format='PNG')
             
-            # 7. 获取地理边界 (leaflet格式: [[south, west], [north, east]])
-            bounds = xds.rio.bounds()  # (west, south, east, north)
-            leaflet_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]  # [[south, west], [north, east]]
+            # 7. 获取地理边界
+            # rioxarray.bounds() 返回: (minx, miny, maxx, maxy) 即 (west, south, east, north)
+            bounds = xds.rio.bounds()
+            
+            # folium ImageOverlay 需要: [[south, west], [north, east]]
+            # 注意: 不需要翻转,因为我们已经flipud了数组
+            leaflet_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+            
+            # 调试信息
+            st.sidebar.write(f"🗺️ 数据边界:")
+            st.sidebar.write(f"西: {bounds[0]:.2f}, 南: {bounds[1]:.2f}")
+            st.sidebar.write(f"东: {bounds[2]:.2f}, 北: {bounds[3]:.2f}")
             
             # 8. 添加图片到地图
             import folium
