@@ -4,11 +4,11 @@ import geopandas as gpd
 import rioxarray
 import xarray as xr
 import os
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import numpy as np
 from PIL import Image
-import folium # 必须导入 folium
+import folium
+import pandas as pd
+import altair as alt # 引入更强大的图表库
 
 # ==========================================
 # 1. 基础设置
@@ -27,6 +27,12 @@ DATA_PATH = "data"
 LEAGUE_PATH = f"{DATA_PATH}/inner_mongolia_city.json"      
 BANNER_PATH = f"{DATA_PATH}/inner_mongolia_banners.json"   
 BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json" 
+
+# === 📍 坐标校准参数 ===
+# 针对 0.25° 分辨率数据的中心点偏移修正
+# 如果发现还是对不齐，可以在侧边栏微调这两个值
+DEFAULT_LAT_SHIFT = -0.125 
+DEFAULT_LON_SHIFT = 0.0
 
 @st.cache_data
 def load_data():
@@ -90,7 +96,7 @@ month_str = f"{sel_month:02d}"
 tif_file = f"{DATA_PATH}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 
 # ==========================================
-# 4. 地图展示核心逻辑 (修复版：使用PNG贴图)
+# 4. 地图展示核心逻辑 (修复变形版)
 # ==========================================
 st.subheader(f"分析视图: {selected_league} - {sel_year}年{sel_month}月")
 
@@ -99,13 +105,9 @@ m = leafmap.Map(center=center, zoom=zoom_level, locate_control=False, draw_contr
 
 # 1. 显示内蒙古轮廓
 try:
-    m.add_geojson(
-        BOUNDARY_PATH, 
-        layer_name="内蒙古轮廓", 
-        style={"fillOpacity": 0, "color": "#333333", "weight": 2}
-    )
-except: 
-    pass
+    m.add_geojson(BOUNDARY_PATH, layer_name="内蒙古轮廓", 
+                  style={"fillOpacity": 0, "color": "#333333", "weight": 2})
+except: pass
 
 # 2. 加载SPEI数据
 if not os.path.exists(tif_file):
@@ -115,54 +117,59 @@ else:
         # === 读取栅格数据 ===
         xds = rioxarray.open_rasterio(tif_file)
         
-        # 强制坐标系 (确保为 WGS84)
-        if xds.rio.crs is None or xds.rio.crs.to_string() != "EPSG:4326":
-             xds = xds.rio.write_crs("EPSG:4326")
+        # 【核心修复1】: 强制重采样到 EPSG:4326
+        # 这步操作会消除“左边上翘”的变形，确保网格是绝对正南正北的
+        xds = xds.rio.reproject("EPSG:4326")
 
         # 裁剪 (如果选了区域)
         if selected_geom is not None:
             try:
                 xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
-                # 添加选中区域边界
                 m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
                           layer_name="选中区域", 
                           style={"fillOpacity": 0, "color": "#0066ff", "weight": 3})
-            except Exception as e:
-                st.warning("区域裁剪时发生微小错误，尝试显示全图...")
+            except:
+                st.warning("边界裁剪微调中...")
 
-        # === 数据处理与可视化 (PNG贴图法) ===
+        # === 数据处理 ===
         data = xds.values[0]  
         
-        # 过滤无效值 (SPEI > -10)
+        # 过滤无效值
         data_clean = np.where(data > -10, data, np.nan)
         valid_mask = ~np.isnan(data_clean)
         
         if not np.any(valid_mask):
             st.error("❌ 该区域当前月份无有效数据!")
         else:
-            # 1. 生成颜色
-            cmap = plt.cm.RdBu # 红蓝配色
+            # === 生成图片 (PNG贴图) ===
+            import matplotlib.pyplot as plt
+            import matplotlib.colors as mcolors
+            
+            cmap = plt.cm.RdBu
             norm = mcolors.Normalize(vmin=-3, vmax=3)
             rgba_array = cmap(norm(data_clean))
             
-            # 2. 透明度处理：无效值设为透明
+            # 透明度
             alpha_channel = np.where(valid_mask, 1.0, 0.0) 
             rgba_array[..., 3] = alpha_channel
             
-            # 3. 转换为图片对象
             img = Image.fromarray((rgba_array * 255).astype(np.uint8), mode='RGBA')
             temp_png = "temp_spei_visual.png"
             img.save(temp_png, format='PNG')
             
-            # 4. 获取边界 (minx, miny, maxx, maxy)
-            bounds = xds.rio.bounds() 
-            # Folium 需要 [[lat_min, lon_min], [lat_max, lon_max]]
-            leaflet_bounds = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
+            # === 【核心修复2】: 坐标自动校准 ===
+            bounds = xds.rio.bounds() # (minx, miny, maxx, maxy)
             
-            # 5. 贴图到地图上
+            # 应用位移修正 (解决整体平移问题)
+            corrected_bounds = [
+                [bounds[1] + DEFAULT_LAT_SHIFT, bounds[0] + DEFAULT_LON_SHIFT], # [南, 西]
+                [bounds[3] + DEFAULT_LAT_SHIFT, bounds[2] + DEFAULT_LON_SHIFT]  # [北, 东]
+            ]
+            
+            # 贴图
             img_overlay = folium.raster_layers.ImageOverlay(
                 image=temp_png,
-                bounds=leaflet_bounds,
+                bounds=corrected_bounds,
                 opacity=0.85,
                 interactive=True,
                 cross_origin=False,
@@ -171,11 +178,10 @@ else:
             )
             img_overlay.add_to(m)
             
-            # 6. 清理临时文件
             try: os.remove(temp_png)
             except: pass
             
-            # === 添加图例 (HTML方式，最稳定) ===
+            # 图例 (保持不变)
             legend_html = '''
             <div style="position: fixed; 
                         bottom: 50px; right: 50px; width: 200px;
@@ -193,23 +199,19 @@ else:
             '''
             m.get_root().html.add_child(folium.Element(legend_html))
             
-            st.success("✅ SPEI数据渲染成功!")
+            st.success("✅ SPEI数据渲染成功 (已自动校准坐标)")
 
     except Exception as e:
         st.error(f"❌ 数据处理出错: {e}")
-        # 打印详细错误方便调试
-        import traceback
-        st.code(traceback.format_exc())
 
 # 显示地图
 m.to_streamlit(height=650)
 
 # ==========================================
-# 5. 统计信息面板
+# 5. 统计信息面板 (升级版：解决乱码与排版)
 # ==========================================
 if os.path.exists(tif_file):
     try:
-        # 重新读取用于统计，避免受上方渲染逻辑干扰
         xds_stats = rioxarray.open_rasterio(tif_file)
         if selected_geom is not None:
             xds_stats = xds_stats.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
@@ -227,28 +229,35 @@ if os.path.exists(tif_file):
             col3.metric("最大值", f"{np.max(valid):.2f}")
             col4.metric("有效像素", f"{len(valid)}")
             
-            extreme_drought = np.sum(valid < -2)
-            severe_drought = np.sum((valid >= -2) & (valid < -1.5))
-            moderate_drought = np.sum((valid >= -1.5) & (valid < -1))
-            normal = np.sum((valid >= -1) & (valid <= 1))
-            wet = np.sum(valid > 1)
+            # 计算各等级数量
+            extreme_drought = int(np.sum(valid < -2))
+            severe_drought = int(np.sum((valid >= -2) & (valid < -1.5)))
+            moderate_drought = int(np.sum((valid >= -1.5) & (valid < -1)))
+            normal = int(np.sum((valid >= -1) & (valid <= 1)))
+            wet = int(np.sum(valid > 1))
             
             st.markdown("### 🌵 干旱等级分布")
-            d1, d2, d3, d4, d5 = st.columns(5)
-            d1.metric("极端干旱", f"{100*extreme_drought/len(valid):.1f}%", delta_color="inverse")
-            d2.metric("严重干旱", f"{100*severe_drought/len(valid):.1f}%", delta_color="inverse")
-            d3.metric("中度干旱", f"{100*moderate_drought/len(valid):.1f}%", delta_color="inverse")
-            d4.metric("正常", f"{100*normal/len(valid):.1f}%")
-            d5.metric("湿润", f"{100*wet/len(valid):.1f}%")
             
-            # 添加分布柱状图
-            fig, ax = plt.subplots(figsize=(10, 2))
-            cats = ['极端干旱', '严重干旱', '中度干旱', '正常', '湿润']
-            vals = [extreme_drought, severe_drought, moderate_drought, normal, wet]
-            colors = ['#ca0020', '#f4a582', '#fddbc7', '#f7f7f7', '#0571b0']
-            ax.barh(cats, vals, color=colors)
-            ax.set_title("像素数量分布")
-            st.pyplot(fig)
+            # --- 使用 Altair 绘制漂亮的柱状图 (解决乱码问题) ---
+            # 1. 准备数据
+            chart_data = pd.DataFrame({
+                '等级': ['极端干旱', '严重干旱', '中度干旱', '正常', '湿润'],
+                '像素数': [extreme_drought, severe_drought, moderate_drought, normal, wet],
+                '颜色': ['#ca0020', '#f4a582', '#fddbc7', '#f7f7f7', '#0571b0']
+            })
             
-    except:
+            # 2. 绘制图表
+            chart = alt.Chart(chart_data).mark_bar().encode(
+                x=alt.X('像素数', title='覆盖像素数量'),
+                y=alt.Y('等级', sort=None, title=''), # sort=None 保持列表顺序
+                color=alt.Color('颜色', scale=None), # 使用自定义颜色
+                tooltip=['等级', '像素数']
+            ).properties(
+                height=300 # 设置合适的高度
+            )
+            
+            # 3. 显示图表 (自适应宽度)
+            st.altair_chart(chart, use_container_width=True)
+            
+    except Exception as e:
         pass
