@@ -6,3 +6,4 @@ rasterio
 xarray
 localtileserver
 psutil
+matplotlib
