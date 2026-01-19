@@ -2,7 +2,7 @@ import streamlit as st
 import leafmap.foliumap as leafmap
 import geopandas as gpd
 import rioxarray
-import xarray as xr # 引入 xarray 处理数据
+import xarray as xr
 import os
 
 # ==========================================
@@ -12,23 +12,28 @@ st.set_page_config(page_title="内蒙古干旱监测系统", layout="wide")
 st.title("内蒙古干旱监测与预警系统")
 
 # ==========================================
-# 2. 数据连接配置
+# 2. 数据连接配置 (改为本地直读模式)
 # ==========================================
-# ！！！请务必修改下面这一行，换成你自己的 GitHub 用户名！！！
-USER_NAME = "nuanqituan" 
-REPO_NAME = "inner-mongolia-drought"
+# 既然你的 app.py 和 data 文件夹在同一个仓库里
+# Streamlit Cloud 会自动把它们下载到服务器的本地硬盘
+# 我们直接用 "相对路径"，速度最快，且不需要用户名
 
-REPO_URL = f"https://raw.githubusercontent.com/{USER_NAME}/{REPO_NAME}/main/data"
+DATA_PATH = "data"  # 你的数据文件夹名字
 
-LEAGUE_URL = f"{REPO_URL}/inner_mongolia_city.json"      
-BANNER_URL = f"{REPO_URL}/inner_mongolia_banners.json"   
-BOUNDARY_URL = f"{REPO_URL}/inner_mongolia_boundary.json" 
+# 矢量文件路径
+LEAGUE_PATH = f"{DATA_PATH}/inner_mongolia_city.json"      
+BANNER_PATH = f"{DATA_PATH}/inner_mongolia_banners.json"   
+BOUNDARY_PATH = f"{DATA_PATH}/inner_mongolia_boundary.json" 
 
 @st.cache_data
 def load_data():
+    # 检查本地文件是否存在，方便调试
+    if not os.path.exists(LEAGUE_PATH):
+        return None, None
+        
     try:
-        leagues_gdf = gpd.read_file(LEAGUE_URL)
-        banners_gdf = gpd.read_file(BANNER_URL)
+        leagues_gdf = gpd.read_file(LEAGUE_PATH)
+        banners_gdf = gpd.read_file(BANNER_PATH)
         return leagues_gdf, banners_gdf
     except Exception as e:
         return None, None
@@ -36,7 +41,11 @@ def load_data():
 leagues_gdf, banners_gdf = load_data()
 
 if leagues_gdf is None or banners_gdf is None:
-    st.error(f"❌ 数据加载失败！请检查 GitHub 用户名 '{USER_NAME}' 是否正确。")
+    st.error(f"❌ 本地数据加载失败！\n请检查你的 GitHub 仓库里是否有 'data' 文件夹，且里面有 inner_mongolia_city.json 等文件。")
+    # 打印当前目录文件，帮你找错
+    st.write("当前目录下的文件:", os.listdir("."))
+    if os.path.exists("data"):
+        st.write("data 文件夹下的文件:", os.listdir("data")[:5]) # 只显示前5个
     st.stop()
 
 # ==========================================
@@ -82,8 +91,9 @@ sel_scale = scale_map[scale_display]
 sel_year = st.sidebar.slider("📅 年份", 1950, 2025, 2024)
 sel_month = st.sidebar.select_slider("🗓️ 月份", range(1, 13), 8)
 
+# 构造本地文件路径
 month_str = f"{sel_month:02d}"
-tif_url = f"{REPO_URL}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
+tif_file = f"{DATA_PATH}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 
 # ==========================================
 # 4. 地图展示核心逻辑
@@ -91,74 +101,49 @@ tif_url = f"{REPO_URL}/SPEI_{sel_scale}_{sel_year}_{month_str}.tif"
 st.subheader(f"分析视图: {selected_league} - {sel_year}年{sel_month}月")
 
 m = leafmap.Map(center=center, zoom=zoom_level)
-# SPEI通常在 -2.5 到 2.5 之间。我们在 ArcGIS 截图里看到有 -8.2 的极端值。
-# 这里把范围稍微调大一点，避免极端值颜色饱和
 vis_params = {'min': -3.0, 'max': 3.0, 'palette': 'RdBu'}
 
 # 1. 显示内蒙古轮廓
 try:
-    m.add_geojson(BOUNDARY_URL, layer_name="内蒙古轮廓", style={"fillOpacity": 0, "color": "#333333", "weight": 2})
+    m.add_geojson(BOUNDARY_PATH, layer_name="内蒙古轮廓", style={"fillOpacity": 0, "color": "#333333", "weight": 2})
 except:
     pass 
 
 # 2. 加载数据
-if selected_geom is not None:
-    # === 局部裁剪模式 ===
-    try:
-        with st.spinner('正在处理数据...'):
-            # 读取数据
-            xds = rioxarray.open_rasterio(tif_url)
-            
-            # 【核心修复代码 START】
-            # ArcGIS 显示正常是因为它自动过滤了 -9999。
-            # 这里我们手动操作：只要小于 -10 的数值，统统变成 NaN (透明)
-            # SPEI 指数不可能小于 -10，所以这很安全。
-            xds = xds.where(xds > -10)
-            # 【核心修复代码 END】
-
-            # 裁剪
-            clipped = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
-            
-            # 数据侦探：看看现在真正的最大最小值是多少
-            try:
-                valid_min = float(clipped.min())
-                valid_max = float(clipped.max())
-                st.sidebar.success(f"🔍 数据侦探 (已过滤背景):\n最小值: {valid_min:.2f}\n最大值: {valid_max:.2f}")
-            except:
-                pass
-
-            # 保存并显示
-            temp_file = "temp_clipped.tif"
-            clipped.rio.to_raster(temp_file)
-            m.add_raster(temp_file, layer_name="局部干旱等级", **vis_params)
-            
-            # 蓝色高亮框
-            m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
-                      layer_name="选中区域边界", style={"fillOpacity": 0, "color": "blue", "weight": 2})
-            
-    except Exception as e:
-        st.warning(f"无法加载数据，可能该月数据缺失或网络超时。")
+# 检查文件是否存在
+if not os.path.exists(tif_file):
+    st.warning(f"⚠️ 找不到该月份的数据文件: {tif_file}")
 else:
-    # === 全图概览模式 ===
-    # 注意：为了解决全图变红，全图模式也必须下载-过滤-保存，不能直接用 add_cog_layer
     try:
-        with st.spinner('正在加载全区数据...'):
-            xds = rioxarray.open_rasterio(tif_url)
-            
-            # 【核心修复】过滤背景
-            xds = xds.where(xds > -10)
-            
-            temp_file = "temp_full.tif"
-            xds.rio.to_raster(temp_file)
-            m.add_raster(temp_file, layer_name="全区干旱等级", **vis_params)
-    except:
-         st.warning("全区数据加载超时，请尝试选择具体的盟市或旗县。")
+        # 使用 rioxarray 读取本地文件 (速度极快)
+        xds = rioxarray.open_rasterio(tif_file)
+        
+        # 【去红操作】过滤无效背景 (小于-10变透明)
+        xds = xds.where(xds > -10)
+        
+        # 如果选了区域，进行裁剪
+        if selected_geom is not None:
+             xds = xds.rio.clip([selected_geom], crs="EPSG:4326", drop=True)
+             # 高亮边框
+             m.add_gdf(gpd.GeoDataFrame(geometry=[selected_geom], crs="EPSG:4326"), 
+                      layer_name="选中区域边界", style={"fillOpacity": 0, "color": "blue", "weight": 2})
 
+        # 显示数据侦探
+        try:
+            valid_min = float(xds.min())
+            valid_max = float(xds.max())
+            st.sidebar.success(f"🔍 数据侦探:\nMin: {valid_min:.2f} | Max: {valid_max:.2f}")
+        except:
+            pass
 
-# 尝试添加图例 (如果不报错的话)
-try:
-    m.add_colormap('RdBu', vmin=-3.0, vmax=3.0, label="SPEI Index")
-except:
-    pass
+        # 保存临时文件用于展示
+        # 这一步是为了让 leafmap 读取处理过(去红)的数据
+        temp_file = "temp_display.tif"
+        xds.rio.to_raster(temp_file)
+        
+        m.add_raster(temp_file, layer_name="干旱监测数据", **vis_params)
+
+    except Exception as e:
+        st.error(f"数据处理出错: {e}")
 
 m.to_streamlit(height=650)
