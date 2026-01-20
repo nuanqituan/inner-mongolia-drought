@@ -7,3 +7,5 @@ xarray
 localtileserver
 psutil
 matplotlib
+folium
+streamlit-option-menu
